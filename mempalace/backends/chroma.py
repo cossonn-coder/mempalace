@@ -2,6 +2,7 @@
 
 import contextlib
 import datetime as _dt
+import json
 import logging
 import os
 import pickle
@@ -31,6 +32,49 @@ logger = logging.getLogger(__name__)
 _REQUIRED_OPERATORS = frozenset({"$eq", "$ne", "$in", "$nin", "$and", "$or", "$contains"})
 _OPTIONAL_OPERATORS = frozenset({"$gt", "$gte", "$lt", "$lte"})
 _SUPPORTED_OPERATORS = _REQUIRED_OPERATORS | _OPTIONAL_OPERATORS
+
+
+# Filename that persists the embedder model_name alongside a palace, so
+# subsequent reopens can re-instantiate the matching EF without the caller
+# remembering which model was used at creation. ChromaDB 1.x does not
+# persist the EF identity on the collection, hence this side-channel.
+_EMBEDDER_MARKER_FILENAME = ".mempalace-embedder.json"
+_EMBEDDER_MARKER_VERSION = 1
+
+
+def _read_embedder_marker(palace_path: str) -> Optional[str]:
+    """Return the persisted embedder ``model_name`` for ``palace_path``, or ``None``.
+
+    Missing file, unreadable file, malformed JSON, or absent ``model`` key all
+    return ``None`` — callers fall back to the legacy MiniLM default in those
+    cases, preserving compat with palaces created before this side-channel
+    existed.
+    """
+    marker_path = os.path.join(palace_path, _EMBEDDER_MARKER_FILENAME)
+    try:
+        with open(marker_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    model = data.get("model") if isinstance(data, dict) else None
+    return str(model) if model else None
+
+
+def _write_embedder_marker(palace_path: str, model_name: str) -> None:
+    """Persist ``model_name`` at the palace root so reopens auto-resolve the EF.
+
+    Idempotent: overwrites any existing marker. Best-effort — failures are
+    logged but never raised, since this is a side-channel and the caller
+    can still complete the create. (A missing marker only forces the
+    legacy MiniLM fallback on next open, which is recoverable.)
+    """
+    marker_path = os.path.join(palace_path, _EMBEDDER_MARKER_FILENAME)
+    payload = {"model": model_name, "version": _EMBEDDER_MARKER_VERSION}
+    try:
+        with open(marker_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+    except OSError:
+        logger.exception("Failed to write embedder marker at %s", marker_path)
 
 # A healthy HNSW payload should keep link_lists.bin proportional to
 # data_level0.bin. When link_lists.bin grows orders of magnitude larger than
@@ -1109,18 +1153,33 @@ class ChromaBackend(BaseBackend):
         self._closed = False
 
     @staticmethod
-    def _resolve_embedding_function():
-        """Return the EF for the user's ``embedding_device`` setting.
+    def _resolve_embedding_function(
+        palace_path: Optional[str] = None,
+        model_name: Optional[str] = None,
+    ):
+        """Return the EF for the user's ``embedding_device`` setting and chosen model.
 
         Both ``get_collection`` and ``get_or_create_collection`` must receive
         the EF explicitly — ChromaDB 1.x does not persist it with the
         collection, so a reader that omits the argument silently gets the
         library default and its queries won't match the writer's vectors.
+
+        Resolution priority for the model:
+
+        1. Explicit ``model_name`` argument (caller knows what it wants).
+        2. Persisted marker at ``<palace_path>/.mempalace-embedder.json``
+           (a palace previously created with a non-default embedder).
+        3. ``None`` — falls through to the legacy ONNX MiniLM-L6 default.
+
+        Both ``palace_path`` and ``model_name`` default to ``None`` so legacy
+        callers (mcp_server, miner) keep working unchanged.
         """
         try:
             from ..embedding import get_embedding_function
 
-            return get_embedding_function()
+            if model_name is None and palace_path is not None:
+                model_name = _read_embedder_marker(palace_path)
+            return get_embedding_function(model_name=model_name)
         except Exception:
             logger.exception("Failed to build embedding function; using chromadb default")
             return None
@@ -1313,10 +1372,22 @@ class ChromaBackend(BaseBackend):
 
         client = self._client(palace_path)
         hnsw_space = "cosine"
+        explicit_model: Optional[str] = None
         if options and isinstance(options, dict):
             hnsw_space = options.get("hnsw_space", hnsw_space)
+            explicit_model = options.get("embedding_model")
 
-        ef = self._resolve_embedding_function()
+        # Persist the explicit model BEFORE resolving the EF — this way the
+        # marker is on disk even if EF construction fails later, and
+        # subsequent reopens can recover. Only fires on create=True; reopens
+        # must not overwrite a palace's persisted choice.
+        if create and explicit_model:
+            _write_embedder_marker(palace_path, explicit_model)
+
+        ef = self._resolve_embedding_function(
+            palace_path=palace_path,
+            model_name=explicit_model,
+        )
         ef_kwargs = {"embedding_function": ef} if ef is not None else {}
 
         if create:
